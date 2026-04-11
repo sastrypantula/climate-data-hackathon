@@ -1,96 +1,118 @@
-import React, { useState, useEffect, useRef } from 'react'
-import InputsPanel from './components/InputsPanel'
-import PriceChart from './components/PriceChart'
-import InsightCards from './components/InsightCards'
-import LoadingSkeleton from './components/LoadingSkeleton'
-import DashboardHeader from './components/DashboardHeader'
-import { ErrorState, EmptyState } from './components/States'
-import { usePrediction } from './hooks/usePrediction'
+import { Suspense, lazy, useMemo, useState } from 'react'
+import HeroHeader from './components/HeroHeader'
+import UpdatedAnalysisCard from './components/UpdatedAnalysisCard'
+import EnhancedRanking from './components/EnhancedRanking'
+import { useDashboardData } from './hooks/useDashboardData'
+
+const ProbabilityChartPanel = lazy(() => import('./components/ProbabilityChartPanel'))
 
 export default function App() {
   const [company, setCompany] = useState('NTPC.NS')
-  const [month, setMonth] = useState(5)
-  const [tempChange, setTempChange] = useState(0)
-  const debounceTimerRef = useRef(null)
 
-  const { data, loading, error, backendStatus, predict, clearError } = usePrediction()
+  const {
+    analysis,
+    ranking,
+    loadingAnalysis,
+    loadingRanking,
+    analysisError,
+    rankingError,
+    analyzeStock,
+    lastUpdated,
+  } = useDashboardData()
 
-  // Auto-trigger prediction when inputs change (with debounce for slider)
-  useEffect(() => {
-    // Clear existing debounce timer
-    if (debounceTimerRef.current) {
-      clearTimeout(debounceTimerRef.current)
-    }
+  const handleAnalyzeClick = () => {
+    analyzeStock(company)
+  }
 
-    // Set new debounce timer (300ms delay so slider doesn't spam API)
-    debounceTimerRef.current = setTimeout(() => {
-      // Note: month is kept in UI state for context only, not sent to API
-      console.log('🔵 Prediction triggered:', { company, scenarioContext: month, tempChange })
-      clearError()
-      predict(company, 6, tempChange) // Always use mid-year month (6) for consistent baseline
-    }, 300)
+  const currentTemp = analysis?.current_temp
+  const alert = analysis?.alert || 'Normal climate'
+  const climateImpact = analysis?.climate_impact || 'Low'
+  const climateAlertBadge = analysis?.climate_alert_badge || 'Normal'
+  const marketTrend = analysis?.market_trend || 'Neutral'
 
-    // Cleanup on unmount or when inputs change
-    return () => {
-      if (debounceTimerRef.current) {
-        clearTimeout(debounceTimerRef.current)
+  const chartData = useMemo(
+    () =>
+      ranking.map((item) => ({
+        ...item,
+        label: item.company.replace('.NS', ''),
+      })),
+    [ranking]
+  )
+
+  const lowOpportunity = useMemo(
+    () => ranking.length > 0 && ranking.every((item) => item.signal !== 'BUY'),
+    [ranking]
+  )
+
+  const opportunity = useMemo(() => {
+    if (!ranking.length) {
+      return {
+        best: null,
+        worst: null,
+        recommendation: 'Run analysis to surface today\'s best setup.',
       }
     }
-  }, [company, month, tempChange, predict, clearError])
+
+    const best = ranking[0]
+    const worst = ranking[ranking.length - 1]
+
+    let recommendation = 'Mixed setup. Prioritize selective entries.'
+    if (best.predicted_return > 1) {
+      recommendation = `Focus on ${best.company.replace('.NS', '')} for highest upside.`
+    } else if (worst.predicted_return < -1 && best.predicted_return <= 1) {
+      recommendation = `Risk elevated. Avoid ${worst.company.replace('.NS', '')} for now.`
+    }
+
+    return { best, worst, recommendation }
+  }, [ranking])
 
   return (
-    <div className="min-h-screen" style={{ background: 'linear-gradient(135deg, #f8fafc 0%, #f0f9ff 100%)' }}>
-      {/* Header */}
-      <DashboardHeader backendStatus={backendStatus} />
+    <div className="min-h-screen dashboard-bg text-slate-100">
+      <main className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 pb-14 pt-5 sm:px-6 lg:px-8 lg:pt-8">
+        <HeroHeader
+          currentTemp={currentTemp}
+          alert={alert}
+          climateImpact={climateImpact}
+          climateAlertBadge={climateAlertBadge}
+          marketTrend={marketTrend}
+          opportunity={opportunity}
+          lastUpdated={lastUpdated}
+        />
 
-      {/* Main layout: 3-section design */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {/* SECTION 1: Inputs Panel (Top) */}
-        <div className="mb-8">
-          <InputsPanel
+        <section className="mx-auto w-full max-w-3xl">
+          <UpdatedAnalysisCard
             company={company}
             setCompany={setCompany}
-            month={month}
-            setMonth={setMonth}
-            tempChange={tempChange}
-            setTempChange={setTempChange}
-            loading={loading}
+            onAnalyze={handleAnalyzeClick}
+            loading={loadingAnalysis}
+            error={analysisError}
+            analysis={analysis}
           />
-        </div>
+        </section>
 
-        {/* SECTION 2: Loading / Error / Chart (Center - Main Focus) */}
-        {loading && <LoadingSkeleton />}
-
-        {error && (
-          <ErrorState message={error} onRetry={() => {
-            console.log('🔄 Retrying prediction...')
-            clearError()
-            predict(company, month, tempChange)
-          }} />
-        )}
-
-        {!loading && !error && !data && <EmptyState />}
-
-        {!loading && !error && data && (
-          <div className="space-y-8 fade-in-up">
-            {/* Large Price Chart */}
-            <div className="scale-in">
-              <PriceChart prediction={data} tempChange={tempChange} />
-            </div>
-
-            {/* SECTION 3: Insight Cards (Bottom) */}
-            <div>
-              <InsightCards prediction={data} />
-            </div>
-          </div>
-        )}
+        <section className="w-full">
+          <EnhancedRanking
+            ranking={ranking}
+            loading={loadingRanking}
+            error={rankingError}
+            chart={
+              <Suspense
+                fallback={
+                  <div className="mt-4 flex h-[220px] items-center justify-center text-sm text-slate-300">
+                    Loading chart...
+                  </div>
+                }
+              >
+                <ProbabilityChartPanel
+                  data={chartData}
+                  loading={loadingRanking}
+                  lowOpportunity={lowOpportunity}
+                />
+              </Suspense>
+            }
+          />
+        </section>
       </main>
-      {/* Footer */}
-      <footer className="border-t border-slate-300 mt-12 py-6 px-6 text-center bg-white/50 backdrop-blur-sm">
-        <p className="text-xs text-slate-600">
-          Climate Finance Dashboard · 2026
-        </p>
-      </footer>
     </div>
   )
 }
