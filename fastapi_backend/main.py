@@ -362,6 +362,11 @@ def _what_if_at_35c(predicted_return: float, current_temp: float):
     }
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 @app.get("/analyze")
 def analyze(company: str = "NTPC.NS"):
     if company not in stocks:
