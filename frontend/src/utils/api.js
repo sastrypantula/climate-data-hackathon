@@ -1,4 +1,4 @@
-const BASE_URL = 'http://localhost:8000'
+const BASE_URL = import.meta.env.VITE_API_URL || 'https://climate-hack.onrender.com'
 
 async function request(path) {
   try {
@@ -13,7 +13,7 @@ async function request(path) {
         // Keep fallback error detail.
       }
       if (response.status === 404 || String(detail).toLowerCase().includes('not found')) {
-        detail = 'Endpoint not found. Verify backend is running on http://localhost:8000'
+        detail = 'Endpoint not found. Verify backend is running on the Render URL'
       }
 
       throw new Error(detail)
@@ -22,7 +22,7 @@ async function request(path) {
     return response.json()
   } catch (error) {
     if (error instanceof TypeError && error.message.includes('fetch')) {
-      throw new Error('Backend server not responding. Ensure backend is running: python main.py')
+      throw new Error('Backend server not responding. Ensure the Render backend is reachable')
     }
     throw error
   }
