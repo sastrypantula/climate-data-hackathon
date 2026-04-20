@@ -1,4 +1,4 @@
-const BASE_URL = import.meta.env.VITE_API_URL || 'https://climate-hack.onrender.com'
+const BASE_URL = import.meta.env.VITE_API_URL || 'https://climate-data-hackathon.onrender.com'
 
 async function request(path) {
   try {
