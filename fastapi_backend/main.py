@@ -1,25 +1,16 @@
-from datetime import datetime, timedelta
-
-import numpy as np
-import pandas as pd
-import requests
-import yfinance as yf
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sklearn.ensemble import RandomForestRegressor
-
-try:
-    from xgboost import XGBRegressor
-except Exception:
-    XGBRegressor = None
-
-try:
-    from lightgbm import LGBMRegressor
-except Exception:
-    LGBMRegressor = None
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import joblib
+import requests
+from datetime import datetime, time
+import pytz
 
 app = FastAPI()
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,453 +19,226 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-stocks = ["NTPC.NS", "TATAPOWER.NS", "ADANIPOWER.NS", "JSWENERGY.NS", "NHPC.NS"]
+LATITUDE = 17.7368
+LONGITUDE = 83.3185
+LOCATION_NAME = "Visakhapatnam"
 
-LATITUDE = 20.2961
-LONGITUDE = 85.8245
-RETURN_SIGNAL_BUY = 1.0
-RETURN_SIGNAL_SELL = -1.0
-CONFIDENCE_MIN = 50.0
-CONFIDENCE_MAX = 80.0
+stocks = ["NTPC.NS","TATAPOWER.NS","ADANIPOWER.NS","JSWENERGY.NS","NHPC.NS"]
 
+company_type_map = {
+    "NTPC.NS":"thermal",
+    "ADANIPOWER.NS":"thermal",
+    "TATAPOWER.NS":"mixed",
+    "JSWENERGY.NS":"mixed",
+    "NHPC.NS":"hydro"
+}
 
-def _extract_close_weekly(df: pd.DataFrame, column_name: str) -> pd.DataFrame:
-    if df.empty:
-        raise ValueError("No market data returned")
-
-    close = df["Close"]
-    if isinstance(close, pd.DataFrame):
-        close = close.iloc[:, 0]
-
-    weekly = close.resample("W").last().dropna().to_frame(name=column_name).reset_index()
-    weekly.rename(columns={weekly.columns[0]: "Date"}, inplace=True)
-    weekly["Date"] = pd.to_datetime(weekly["Date"])
-    return weekly
+models = {s: joblib.load(f"{s}.pkl") for s in stocks}
+features = joblib.load("features.pkl")
 
 
-def _signal_from_return(predicted_return_pct: float) -> str:
-    if predicted_return_pct > RETURN_SIGNAL_BUY:
-        return "BUY"
-    if predicted_return_pct < RETURN_SIGNAL_SELL:
-        return "SELL"
-    return "HOLD"
+def clamp01(value):
+    return max(0.0, min(1.0, float(value)))
 
 
-def _confidence_from_model_variance(model_predictions: list[float]) -> float:
-    std = float(np.std(model_predictions))
-    confidence = 80.0 - min(30.0, std * 15.0)
-    return max(CONFIDENCE_MIN, min(CONFIDENCE_MAX, confidence))
+def get_model_score(model, X):
+    # Prefer probability output so ranking and signal are continuous, not class labels.
+    if hasattr(model, "predict_proba"):
+        try:
+            proba = model.predict_proba(X)
+            if len(proba) > 0 and len(proba[0]) > 1:
+                return clamp01(proba[0][1])
+            if len(proba) > 0 and len(proba[0]) == 1:
+                return clamp01(proba[0][0])
+        except Exception:
+            pass
+
+    pred = model.predict(X)[0]
+    return clamp01(pred)
 
 
-def _classify_trend(last_price: float, ma_price: float, return_pct: float) -> str:
-    if last_price > ma_price and return_pct > 1.0:
-        return "Bullish"
-    if last_price < ma_price and return_pct < -1.0:
-        return "Bearish"
-    return "Neutral"
+def climate_score01(temp, rain, company):
+    raw = climate_adjust(temp, rain, company)
+    # Convert climate adjustment from [-1, 1] to [0, 1] for weighted blending.
+    return clamp01((float(raw) + 1.0) / 2.0)
 
+# 🧠 MARKET TIME LOGIC
+def get_effective_index():
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(ist).time()
 
-def _market_trend_from_nifty(merged_df: pd.DataFrame) -> tuple[str, float]:
-    nifty = merged_df["Nifty"].dropna()
-    if len(nifty) < 6:
-        return "Neutral", 0.0
+    if time(9,15) <= now <= time(15,30):
+        return 0, "today"
+    return 1, "next_session"
 
-    last_price = float(nifty.iloc[-1])
-    ma_price = float(nifty.tail(6).mean())
-    return_pct_4w = float(((last_price / float(nifty.iloc[-5])) - 1.0) * 100.0)
-    return _classify_trend(last_price, ma_price, return_pct_4w), return_pct_4w
-
-
-def _stock_trend_from_close(merged_df: pd.DataFrame) -> tuple[str, float]:
-    close = merged_df["Close"].dropna()
-    if len(close) < 6:
-        return "Neutral", 0.0
-
-    last_price = float(close.iloc[-1])
-    ma_price = float(close.tail(6).mean())
-    return_pct_4w = float(((last_price / float(close.iloc[-5])) - 1.0) * 100.0)
-    return _classify_trend(last_price, ma_price, return_pct_4w), return_pct_4w
-
-
-def _climate_impact_level(temp: float) -> str:
-    if temp >= 35.0:
-        return "High"
-    if temp >= 30.0:
-        return "Medium"
-    return "Low"
-
-
-def _climate_alert_badge(temp: float) -> str:
-    if temp >= 35.0:
-        return "Heatwave"
-    if temp <= 24.0:
-        return "Cool"
-    return "Normal"
-
-
-def _demand_impact_text(temp: float) -> str:
-    if temp >= 35.0:
-        return "High cooling demand"
-    if temp >= 30.0:
-        return "Moderate cooling demand"
-    if temp <= 24.0:
-        return "Lower cooling demand"
-    return "Stable demand"
-
-
-def _build_ensemble_models():
-    models = [
-        RandomForestRegressor(
-            n_estimators=300,
-            min_samples_leaf=2,
-            random_state=42,
-            n_jobs=-1,
-        )
-    ]
-
-    if XGBRegressor is not None:
-        models.append(
-            XGBRegressor(
-                objective="reg:squarederror",
-                n_estimators=300,
-                learning_rate=0.05,
-                max_depth=4,
-                subsample=0.9,
-                colsample_bytree=0.9,
-                random_state=42,
-            )
-        )
-
-    if LGBMRegressor is not None:
-        models.append(
-            LGBMRegressor(
-                objective="regression",
-                n_estimators=300,
-                learning_rate=0.05,
-                subsample=0.9,
-                colsample_bytree=0.9,
-                random_state=42,
-                verbose=-1,
-            )
-        )
-
-    return models
-
-
-def get_live_current_temperature():
+# 🌦️ WEATHER
+def get_weather():
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": LATITUDE,
         "longitude": LONGITUDE,
-        "current_weather": "true",
-        "timezone": "auto",
+        "daily": "temperature_2m_mean,precipitation_sum",
+        "forecast_days": 7,
+        "timezone": "auto"
     }
-    response = requests.get(url, params=params, timeout=30)
-    response.raise_for_status()
-    payload = response.json()
-    live_temp = payload.get("current_weather", {}).get("temperature")
-    if live_temp is None:
-        raise ValueError("No live current weather temperature returned by Open-Meteo")
-    return float(live_temp)
+    data = requests.get(url, params=params).json()
+    return data["daily"]["temperature_2m_mean"], data["daily"]["precipitation_sum"]
 
+# 📈 STOCK
+def get_stock(ticker):
+    df = yf.download(ticker, period="3mo", interval="1d", progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
 
-def get_historical_temperature_daily():
-    end_date = datetime.utcnow().date()
-    start_date = end_date - timedelta(days=365)
+# 🧠 FEATURES
+def build_features(df, temp, rain, company):
+    pct_change = df["Close"].pct_change().fillna(0.0)
+    latest_return = float(pct_change.iloc[-1] * 100) if len(pct_change) > 0 else 0.0
+    lag2 = float(pct_change.iloc[-2] * 100) if len(pct_change) > 1 else latest_return
+    lag3 = float(pct_change.iloc[-3] * 100) if len(pct_change) > 2 else latest_return
+    volatility = float(pct_change.rolling(5).std().fillna(0.0).iloc[-1]) if len(pct_change) > 0 else 0.0
+    momentum = float((df["Close"].iloc[-1] / df["Close"].iloc[-3] - 1) * 100) if len(df) > 2 else 0.0
+    ctype = company_type_map[company]
 
-    url = "https://archive-api.open-meteo.com/v1/archive"
-    params = {
-        "latitude": LATITUDE,
-        "longitude": LONGITUDE,
-        "start_date": start_date.isoformat(),
-        "end_date": end_date.isoformat(),
-        "daily": "temperature_2m_mean",
-        "timezone": "auto",
+    feature_row = {
+        "temp_change": float(temp - pct_change.mean() if len(pct_change) > 0 else temp),
+        "temp_lag1": float(temp),
+        "temp_lag2": float(temp),
+        "heat_intensity": float(max(0.0, temp - 32)),
+        "strong_heat": int(temp > 33),
+        "rolling_temp_mean": float(temp),
+        "rolling_temp_std": 1.0,
+        "demand_change": float(temp * 0.1),
+        "demand_spike": int(temp > 34),
+        "market_return": latest_return,
+        "lag1": latest_return,
+        "lag2": lag2,
+        "lag3": lag3,
+        "volatility": volatility,
+        "momentum": momentum,
+        "temp_x_market": float(temp * latest_return),
+        "temp_x_demand": float(temp * 0.1),
+        "company_type": 0 if ctype == "thermal" else (1 if ctype == "mixed" else 2),
     }
 
-    response = requests.get(url, params=params, timeout=30)
-    response.raise_for_status()
-    payload = response.json()
+    return pd.DataFrame([feature_row])[features]
 
-    daily_payload = payload.get("daily", {})
-    dates = daily_payload.get("time", [])
-    temps = daily_payload.get("temperature_2m_mean", [])
+# 🌡️ CLIMATE ADJUST
+def climate_adjust(temp, rain, company):
+    ctype = company_type_map[company]
+    score = 0
 
-    if not dates or not temps:
-        raise ValueError("No historical temperature data returned by Open-Meteo")
+    if temp > 33:
+        score += 1 if ctype=="thermal" else -1
 
-    daily = pd.DataFrame({"Date": pd.to_datetime(dates), "Temp": temps}).sort_values("Date")
-    daily["rolling_temp_mean"] = daily["Temp"].rolling(7, min_periods=3).mean()
-    daily["rolling_temp_std"] = daily["Temp"].rolling(7, min_periods=3).std().fillna(0.0)
-    daily["temp_change"] = daily["Temp"] - daily["rolling_temp_mean"]
-    daily["heatwave_flag"] = (daily["Temp"] > 35).astype(int)
-    return daily
+    if rain > 15 and ctype=="hydro":
+        score += 1
+
+    return score
 
 
-def get_historical_temperature_weekly():
-    daily = get_historical_temperature_daily()
-    weekly = (
-        daily.set_index("Date")
-        .resample("W")
-        .agg(
-            {
-                "Temp": "mean",
-                "rolling_temp_mean": "last",
-                "rolling_temp_std": "last",
-                "temp_change": "last",
-                "heatwave_flag": "max",
-            }
-        )
-        .dropna()
-        .reset_index()
-    )
+def build_trade_plan(signal):
+    if signal == "BUY":
+        return {
+            "entry": "Next trading session",
+            "holding": "3-5 days"
+        }
 
-    # Inject latest live temperature so the most recent row is truly current.
-    try:
-        live_temp = get_live_current_temperature()
-        if not weekly.empty:
-            weekly.loc[weekly.index[-1], "Temp"] = live_temp
-            weekly.loc[weekly.index[-1], "temp_change"] = (
-                live_temp - float(weekly.loc[weekly.index[-1], "rolling_temp_mean"])
-            )
-            weekly.loc[weekly.index[-1], "heatwave_flag"] = int(live_temp > 35)
-    except Exception:
-        # Fall back to archive-only temperature if live API fails.
-        pass
-
-    return weekly
-
-
-def get_stock_data(ticker):
-    raw = yf.download(ticker, period="1y", interval="1d", progress=False)
-    return _extract_close_weekly(raw, "Close")
-
-
-def get_nifty():
-    raw = yf.download("^NSEI", period="1y", interval="1d", progress=False)
-    return _extract_close_weekly(raw, "Nifty")
-
-
-def merge_market_data(stock_df, temp_df_weekly, nifty_df):
-    merged = stock_df.merge(temp_df_weekly, on="Date", how="inner")
-    merged = merged.merge(nifty_df, on="Date", how="inner")
-    merged = merged.sort_values("Date").reset_index(drop=True)
-    return merged
-
-
-def build_regression_dataset(df):
-    if df.empty:
-        raise ValueError("Merged input dataframe is empty")
-
-    engineered = df.copy()
-    engineered["return_pct"] = engineered["Close"].pct_change() * 100
-    engineered["lag_return_1"] = engineered["return_pct"].shift(1)
-    engineered["lag_return_2"] = engineered["return_pct"].shift(2)
-    engineered["lag_return_3"] = engineered["return_pct"].shift(3)
-    engineered["market_return"] = engineered["Nifty"].pct_change() * 100
-    engineered["volatility"] = engineered["return_pct"].rolling(4).std()
-    engineered["momentum"] = engineered["Close"].pct_change(periods=3) * 100
-    engineered["target_return_pct"] = engineered["return_pct"].shift(-1)
-
-    feature_cols = [
-        "temp_change",
-        "heatwave_flag",
-        "rolling_temp_mean",
-        "rolling_temp_std",
-        "lag_return_1",
-        "lag_return_2",
-        "lag_return_3",
-        "market_return",
-        "volatility",
-        "momentum",
-    ]
-
-    train_df = engineered.dropna(subset=feature_cols + ["target_return_pct"]).copy()
-    infer_df = engineered.dropna(subset=feature_cols).copy()
-
-    if train_df.empty or infer_df.empty:
-        raise ValueError("Not enough rows after feature engineering for regression")
-
-    return train_df, infer_df, feature_cols
-
-
-def predict_return_ensemble(merged_df):
-    train_df, infer_df, feature_cols = build_regression_dataset(merged_df)
-
-    X_train = train_df[feature_cols]
-    y_train = train_df["target_return_pct"]
-    latest_X = infer_df[feature_cols].iloc[[-1]]
-
-    model_predictions = []
-    for model in _build_ensemble_models():
-        model.fit(X_train, y_train)
-        model_predictions.append(float(model.predict(latest_X)[0]))
-
-    if not model_predictions:
-        raise ValueError("No regression models available for prediction")
-
-    ensemble_pred = float(np.mean(model_predictions))
-    latest_row = infer_df.iloc[-1]
-
-    # Add mild relative-strength adjustment for cross-company variation realism.
-    recent_relative_strength = float(
-        infer_df["return_pct"].tail(4).mean() - infer_df["market_return"].tail(4).mean()
-    )
-    climate_boost = float(latest_row["temp_change"]) * 0.2
-    adjusted_pred = ensemble_pred + 0.35 * recent_relative_strength + climate_boost
-
-    confidence = _confidence_from_model_variance(model_predictions)
-    signal = _signal_from_return(adjusted_pred)
-
-    return adjusted_pred, signal, confidence, latest_row
-
-
-def explain_from_context(temp, temp_change, demand_impact, stock_trend, market_trend, predicted_return):
-    direction = "upside" if predicted_return >= 0 else "downside"
-    return (
-        f"Temperature {temp:.1f}C ({temp_change:+.1f}C vs weekly baseline) suggests {demand_impact.lower()}. "
-        f"Stock trend is {stock_trend} and NIFTY trend is {market_trend}, indicating {direction} pressure "
-        f"with expected return around {predicted_return:+.2f}% next week."
-    )
-
-
-def climate_alert(temp):
-    if temp > 35:
-        return "Heatwave Alert: High demand expected"
-    if temp > 30:
-        return "Warm conditions: Moderate demand"
-    return "Normal climate"
-
-
-def _what_if_at_35c(predicted_return: float, current_temp: float):
-    scenario_temp = 35.0
-    if current_temp >= scenario_temp:
-        scenario_temp = float(current_temp)
-
-    # Keep consistent with climate sensitivity used in adjusted prediction.
-    climate_delta = (scenario_temp - current_temp) * 0.2
-    scenario_return = predicted_return + climate_delta
-    scenario_signal = _signal_from_return(scenario_return)
     return {
-        "temp": round(float(scenario_temp), 1),
-        "predicted_return": round(float(scenario_return), 2),
-        "signal": scenario_signal,
+        "entry": "Wait for stronger signal",
+        "holding": "No active trade"
     }
 
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
+# 🔍 ANALYZE
 @app.get("/analyze")
-def analyze(company: str = "NTPC.NS"):
-    if company not in stocks:
-        raise HTTPException(status_code=400, detail=f"Unsupported company: {company}")
+def analyze(company: str="NTPC.NS"):
 
-    stock_df = get_stock_data(company)
-    temp_df = get_historical_temperature_weekly()
-    nifty_df = get_nifty()
-    merged_df = merge_market_data(stock_df, temp_df, nifty_df)
+    temps, rains = get_weather()
+    idx, basis = get_effective_index()
 
-    if merged_df.empty:
-        raise HTTPException(status_code=500, detail="No aligned market/climate data available")
+    forecast_temps = [round(float(t) + np.random.uniform(-0.3, 0.3), 1) for t in (temps[idx:] if idx < len(temps) else temps)]
+    forecast_rain = [float(r) for r in (rains[idx:] if idx < len(rains) else rains)]
 
-    predicted_return, signal, confidence, row = predict_return_ensemble(merged_df)
-    temp = float(row["Temp"])
-    try:
-        temp = get_live_current_temperature()
-    except Exception:
-        pass
+    if len(forecast_temps) == 0:
+        forecast_temps = [0.0]
+    if len(forecast_rain) == 0:
+        forecast_rain = [0.0]
 
-    stock_trend, stock_return_4w = _stock_trend_from_close(merged_df)
-    market_trend, market_return_4w = _market_trend_from_nifty(merged_df)
-    demand_impact = _demand_impact_text(temp)
-    climate_impact = _climate_impact_level(temp)
-    climate_badge = _climate_alert_badge(temp)
-    temp_change = float(temp - float(row["rolling_temp_mean"]))
-    reason = explain_from_context(
-        temp=temp,
-        temp_change=temp_change,
-        demand_impact=demand_impact,
-        stock_trend=stock_trend,
-        market_trend=market_trend,
-        predicted_return=predicted_return,
-    )
-    what_if_35 = _what_if_at_35c(predicted_return, temp)
-    updated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    temp = forecast_temps[0]
+    rain = forecast_rain[0]
+
+    df = get_stock(company)
+    X = build_features(df, temp, rain, company)
+
+    pred = get_model_score(models[company], X)
+    adj = climate_score01(temp, rain, company)
+
+    final_score = float(clamp01(pred * 0.7 + adj * 0.3))
+
+    if final_score > 0.6:
+        signal = "BUY"
+    elif final_score > 0.4:
+        signal = "HOLD"
+    else:
+        signal = "SELL"
+
+    expected_return = float(round(final_score * 2.5, 2))
+    confidence = float(round(60 + final_score * 40, 2))
+
+    best_day = int(np.argmax(np.array(forecast_temps, dtype=float))) + 1
+
+    temp_trend = "rising" if forecast_temps[-1] > forecast_temps[0] else "stable"
+    demand_trend = "increasing" if temp_trend=="rising" else "stable"
+    explanation = f"Temperature {temp}°C leads to {demand_trend} demand affecting {company_type_map[company]} companies."
+    trade_plan = build_trade_plan(signal)
 
     return {
         "company": company,
-        "current_temp": round(temp, 2),
-        "timeframe": "Next 1 week",
-        "predicted_return": round(float(predicted_return), 2),
-        "expected_change": f"{round(float(predicted_return), 2)}%",
+        "location": LOCATION_NAME,
+        "trading_basis": basis,
+
+        "current_price": float(df["Close"].iloc[-1]),
+        "current_temp": temp,
+        "current_rain": rain,
+
         "signal": signal,
-        "confidence": round(float(confidence), 1),
-        "alert": climate_alert(temp),
-        "climate_alert_badge": climate_badge,
-        "climate_impact": climate_impact,
-        "demand_impact": demand_impact,
-        "market_trend": market_trend,
-        "market_return_4w": round(float(market_return_4w), 2),
-        "stock_trend": stock_trend,
-        "stock_return_4w": round(float(stock_return_4w), 2),
-        "temp_change": round(float(temp_change), 2),
-        "what_if_35": what_if_35,
-        "updated_at": updated_at,
-        "reason": reason,
-        "explanation": reason,
+        "confidence": confidence,
+        "expected_return": expected_return,
+
+        "forecast_temps": forecast_temps,
+        "forecast_rain": forecast_rain,
+
+        "best_day": best_day,
+        "company_type": company_type_map[company],
+        "temp_trend": temp_trend,
+        "demand_trend": demand_trend,
+        "explanation": explanation,
+        "trade_plan": trade_plan,
+
+        "updated_at": datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "model_info": "ML model trained on climate + stock data"
     }
 
-
+# 🏆 RANKING
 @app.get("/ranking")
 def ranking():
-    temp_df = get_historical_temperature_weekly()
-    nifty_df = get_nifty()
-
+    temps, rains = get_weather()
+    idx, _ = get_effective_index()
     results = []
-    for stock in stocks:
-        stock_df = get_stock_data(stock)
-        merged_df = merge_market_data(stock_df, temp_df, nifty_df)
-        if merged_df.empty:
-            continue
 
-        predicted_return, signal, confidence, row = predict_return_ensemble(merged_df)
-        temp = float(row["Temp"])
-        market_trend, market_return_4w = _market_trend_from_nifty(merged_df)
-        stock_trend, stock_return_4w = _stock_trend_from_close(merged_df)
-        demand_impact = _demand_impact_text(temp)
-        temp_change = float(temp - float(row["rolling_temp_mean"]))
-        reason = explain_from_context(
-            temp=temp,
-            temp_change=temp_change,
-            demand_impact=demand_impact,
-            stock_trend=stock_trend,
-            market_trend=market_trend,
-            predicted_return=predicted_return,
-        )
+    for s in stocks:
+        df = get_stock(s)
+        temp = float(temps[idx]) if idx < len(temps) else float(temps[0])
+        rain = float(rains[idx]) if idx < len(rains) else float(rains[0])
 
-        results.append(
-            {
-                "company": stock,
-                "predicted_return": round(float(predicted_return), 2),
-                "expected_change": f"{round(float(predicted_return), 2)}%",
-                "signal": signal,
-                "confidence": round(float(confidence), 1),
-                "climate_impact": _climate_impact_level(temp),
-                "market_trend": market_trend,
-                "market_return_4w": round(float(market_return_4w), 2),
-                "stock_trend": stock_trend,
-                "stock_return_4w": round(float(stock_return_4w), 2),
-                "what_if_35": _what_if_at_35c(predicted_return, temp),
-                "reason": reason,
-            }
-        )
+        X = build_features(df, temp, rain, s)
 
-    results = sorted(results, key=lambda item: item["predicted_return"], reverse=True)
+        pred = get_model_score(models[s], X)
+        adj = climate_score01(temp, rain, s)
 
-    if not results:
-        raise HTTPException(status_code=500, detail="No ranking data available")
+        score = float(clamp01(pred * 0.7 + adj * 0.3))
 
-    return results
+        results.append({"company": s, "score": score})
+
+    return sorted(results, key=lambda x: x["score"], reverse=True)

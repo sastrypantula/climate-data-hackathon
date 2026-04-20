@@ -1,79 +1,56 @@
 import { useCallback, useMemo, useState } from 'react'
-import { fetchAnalysis, fetchRanking, parsePercent } from '../utils/api'
-import {
-  classifySignal,
-  formatExpectedChange,
-  normalizeReason,
-} from '../utils/decision'
+import { fetchAnalysis, fetchRanking } from '../utils/api'
 
 function normalizeAnalysis(raw) {
-  const predictedReturn = Number(raw?.predicted_return ?? parsePercent(raw?.expected_change, 0))
-  const rawConfidence = Number(raw?.confidence ?? 65)
-  const boundedConfidence = Math.max(50, Math.min(80, Number.isFinite(rawConfidence) ? rawConfidence : 65))
-  const base = {
-    ...raw,
-    company: raw?.company,
-    predicted_return: predictedReturn,
-    confidence: Number(boundedConfidence.toFixed(1)),
-    signal: raw?.signal,
-    expected_change: raw?.expected_change ?? `${predictedReturn.toFixed(2)}%`,
-  }
+  const temp = Number(raw?.current_temp ?? 28)
+  const rain = Number(raw?.current_rain ?? 0)
+  const confidence = Number(raw?.confidence ?? 60)
+  const signal = raw?.signal ?? 'HOLD'
+  const forecastTemps = Array.isArray(raw?.forecast_temps) ? raw.forecast_temps : []
+  const forecastRain = Array.isArray(raw?.forecast_rain) ? raw.forecast_rain : []
 
-  const expected = formatExpectedChange(base.expected_change)
-  const computedSignal = base.signal || classifySignal(base.predicted_return)
-  const computedTemp = Number(base.current_temp ?? 28)
-  const climateBadge =
-    base.climate_alert_badge ||
-    (computedTemp >= 35 ? 'Heatwave' : computedTemp <= 24 ? 'Cool' : 'Normal')
+  // Determine climate badge
+  let climateBadge = 'Normal'
+  if (temp >= 35) climateBadge = 'Heatwave'
+  else if (temp >= 33) climateBadge = 'Hot'
+  else if (temp <= 20) climateBadge = 'Cold'
 
-  const whatIfReturn = Number(base?.what_if_35?.predicted_return)
-  const whatIfExpected = formatExpectedChange(
-    Number.isFinite(whatIfReturn) ? `${whatIfReturn.toFixed(2)}%` : '0%'
-  )
+  // Determine climate impact
+  let climateImpact = 'Low'
+  if (temp >= 35 || rain > 30) climateImpact = 'High'
+  else if (temp >= 30 || rain > 20) climateImpact = 'Medium'
 
   return {
-    ...base,
-    current_temp: computedTemp,
-    signal: computedSignal,
-    timeframe: base.timeframe ?? 'Next 1 week',
-    reason: base.reason || base.explanation || normalizeReason('', computedTemp),
-    expected,
-    climate_impact: base.climate_impact || (computedTemp >= 35 ? 'High' : computedTemp >= 30 ? 'Medium' : 'Low'),
+    ...raw,
+    company: raw?.company ?? 'NTPC.NS',
+    current_price: Number(raw?.current_price ?? 0),
+    current_temp: temp,
+    current_rain: rain,
+    signal,
+    confidence: Math.min(99, Math.max(50, confidence)),
+    forecast_temps: forecastTemps,
+    forecast_rain: forecastRain,
     climate_alert_badge: climateBadge,
-    market_trend: base.market_trend || 'Neutral',
-    demand_impact: base.demand_impact || 'Stable demand',
-    temp_change: Number(base.temp_change ?? 0),
-    updated_at: base.updated_at || '',
-    what_if_35: Number.isFinite(whatIfReturn)
-      ? {
-          ...base.what_if_35,
-          expected: whatIfExpected,
-        }
-      : null,
+    climate_impact: climateImpact,
+    updated_at: raw?.updated_at || new Date().toLocaleTimeString('en-IN', { hour12: true }),
   }
 }
 
-function normalizeRanking(rawRanking, referenceTemp) {
-  return rawRanking
+function normalizeRanking(rawRanking) {
+  return (Array.isArray(rawRanking) ? rawRanking : [])
     .map((item) => {
-      const predictedReturn = Number(item.predicted_return ?? parsePercent(item.expected_change, 0))
-      const confidence = Number(item.confidence ?? 50)
-      const expected = formatExpectedChange(
-        item.expected_change ?? `${predictedReturn.toFixed(2)}%`
-      )
-      const tempHint = Number.isFinite(referenceTemp) ? referenceTemp : 28
+      const score = Number(item.score ?? 0)
+      let signal = 'HOLD'
+      if (score > 0.5) signal = 'BUY'
+      else if (score < -0.5) signal = 'SELL'
 
       return {
-        ...item,
-        predicted_return: Number(predictedReturn.toFixed(2)),
-        confidence: Number(Math.max(50, Math.min(80, confidence)).toFixed(1)),
-        signal: item.signal || classifySignal(predictedReturn),
-        expected_change: `${parsePercent(item.expected_change, expected.value).toFixed(2)}%`,
-        expected,
-        reason: normalizeReason(item.reason, tempHint),
+        company: item.company,
+        score: Number(score.toFixed(2)),
+        signal,
       }
     })
-    .sort((a, b) => b.predicted_return - a.predicted_return)
+    .sort((a, b) => b.score - a.score)
 }
 
 export function useDashboardData() {
@@ -98,13 +75,11 @@ export function useDashboardData() {
       ])
 
       const normalizedAnalysis = normalizeAnalysis(analysisResult)
-      const normalizedRanking = normalizeRanking(rankingResult, normalizedAnalysis.current_temp)
+      const normalizedRanking = normalizeRanking(rankingResult)
 
       setAnalysis(normalizedAnalysis)
       setRanking(normalizedRanking)
-      setLastUpdated(
-        normalizedAnalysis.updated_at || new Date().toLocaleString('en-IN', { hour12: true })
-      )
+      setLastUpdated(normalizedAnalysis.updated_at)
     } catch (error) {
       setAnalysisError(error.message || 'Failed to load analysis data.')
       setRankingError(error.message || 'Failed to load ranking data.')
@@ -115,16 +90,9 @@ export function useDashboardData() {
     }
   }, [])
 
-  const confidenceLevel = useMemo(() => {
-    if (!ranking.length) return '--'
-    const average = ranking.reduce((total, item) => total + item.confidence, 0) / ranking.length
-    return `${average.toFixed(1)}%`
-  }, [ranking])
-
   return {
     analysis,
     ranking,
-    confidenceLevel,
     loadingAnalysis,
     loadingRanking,
     analysisError,
