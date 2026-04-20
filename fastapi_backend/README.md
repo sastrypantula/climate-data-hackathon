@@ -79,14 +79,15 @@ curl "http://127.0.0.1:8000/ranking"
 - main.py: API + feature engineering + modeling logic
 - requirements.txt: Python dependencies
 - Dockerfile: container runtime
-- CLOUDRUN_DEPLOYMENT.md: deployment instructions
+- RENDER_DEPLOYMENT.md: deployment instructions for Render
 - start.sh: helper command
 
 ## Deployment Notes
 
 - Container listens on 0.0.0.0 and reads PORT env var.
-- CORS currently open for frontend integration.
-- Use Cloud Run guide in this folder for production deployment.
+- CORS is enabled for frontend integration.
+- See [RENDER_DEPLOYMENT.md](RENDER_DEPLOYMENT.md) for Render deployment steps.
+- Service is designed to be stateless and scalable.
 
 ## IMD Integration Note
 

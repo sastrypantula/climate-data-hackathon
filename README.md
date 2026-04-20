@@ -31,10 +31,10 @@ Note:
 
 ## Architecture
 
-- Frontend: React + Vite + Tailwind + Recharts
-- Backend: FastAPI + pandas + scikit-learn + yfinance + requests
+- Frontend: React + Vite + Tailwind + Recharts (deployed on Vercel)
+- Backend: FastAPI + pandas + scikit-learn + yfinance + requests (deployed on Render)
 - Modeling: On-demand ensemble (RandomForest required, XGBoost/LightGBM optional)
-- Deployment: Docker + Cloud Run friendly runtime
+- Deployment: Docker containers
 
 ## Repository Structure
 
@@ -46,7 +46,7 @@ climate-finance-dashboard/
     main.py
     requirements.txt
     Dockerfile
-    CLOUDRUN_DEPLOYMENT.md
+    RENDER_DEPLOYMENT.md
     start.sh
     climatedatahackathon.ipynb
   frontend/
@@ -135,8 +135,10 @@ Output includes:
 
 ## Deployment
 
-Backend is containerized with Dockerfile and designed for Cloud Run style PORT injection.
-See fastapi_backend/CLOUDRUN_DEPLOYMENT.md for command-by-command deployment.
+**Frontend**: Deployed on Vercel. Set `VITE_API_URL` environment variable to point to your backend.
+
+**Backend**: Deployed on Render. Docker container automatically scales and handles PORT injection.
+See [fastapi_backend/RENDER_DEPLOYMENT.md](fastapi_backend/RENDER_DEPLOYMENT.md) for step-by-step deployment guide.
 
 ## Suggested Next Improvements
 
