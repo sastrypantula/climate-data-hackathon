@@ -157,9 +157,9 @@ export default function Dashboard() {
             <div>
               <h1 className={`text-4xl font-bold tracking-tight ${titleText}`}>ClimateAlpha</h1>
               <p className={`mt-2 ${mutedText}`}>Predicting energy stocks using temperature & rainfall intelligence</p>
-              {analysis?.location ? (
+              {/* {analysis?.location ? (
                 <p className={`mt-3 inline-flex rounded-full border px-3 py-1 text-sm ${darkMode ? 'border-cyan-300/30 bg-cyan-500/10 text-cyan-200' : 'border-cyan-200 bg-cyan-50 text-cyan-800'}`}>📍 Location: {analysis.location}</p>
-              ) : null}
+              ) : null} */}
             </div>
             <button
               type="button"
